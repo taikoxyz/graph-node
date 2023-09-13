@@ -1,0 +1,4 @@
+.env
+.env.l3
+.env*.bak
+data

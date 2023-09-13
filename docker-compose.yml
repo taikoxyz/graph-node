@@ -1,0 +1,215 @@
+version: "3.4"
+x-logging: &logging
+  logging:
+    options:
+      max-size: 10m
+      max-file: "3"
+
+services:
+  l2_execution_engine:
+    image: gcr.io/evmchain/taiko-geth:grimsvotn
+    restart: unless-stopped
+    pull_policy: always
+    stop_grace_period: 3m
+    volumes:
+      - l2_execution_engine_data:/data/taiko-geth
+    ports:
+      - "${PORT_L2_EXECTION_ENGINE_METRICS}:6060"
+      - "${PORT_L2_EXECTION_ENGINE_HTTP}:8545"
+      - "${PORT_L2_EXECTION_ENGINE_WS}:8546"
+      - "${PORT_L2_EXECTION_ENGINE_P2P}:30303"
+      - "${PORT_L2_EXECTION_ENGINE_P2P}:30303/udp"
+    command:
+      - --taiko
+      - --networkid
+      - "${CHAIN_ID}"
+      - --syncmode
+      - full
+      - --gcmode
+      - archive
+      - --datadir
+      - /data/taiko-geth
+      - --metrics
+      - --metrics.expensive
+      - --metrics.addr
+      - "0.0.0.0"
+      - --bootnodes
+      - ${BOOT_NODES}
+      - --authrpc.addr
+      - "0.0.0.0"
+      - --authrpc.vhosts
+      - "*"
+      - --http
+      - --http.api
+      - debug,eth,net,web3,txpool,taiko
+      - --http.addr
+      - "0.0.0.0"
+      - --http.vhosts
+      - "*"
+      - --ws
+      - --ws.api
+      - debug,eth,net,web3,txpool,taiko
+      - --ws.addr
+      - "0.0.0.0"
+      - --ws.origins
+      - "*"
+    <<: *logging
+
+  taiko_client_driver:
+    image: gcr.io/evmchain/taiko-client:grimsvotn
+    restart: unless-stopped
+    pull_policy: always
+    depends_on:
+      - l2_execution_engine
+    env_file:
+      - .env
+    volumes:
+      - l2_execution_engine_data:/data/taiko-geth
+      - ./script/l2:/script
+    entrypoint:
+      - /bin/sh
+      - -c
+      - "/script/start-driver.sh"
+    <<: *logging
+
+  taiko_client_prover_relayer:
+    image: gcr.io/evmchain/taiko-client:grimsvotn
+    restart: unless-stopped
+    pull_policy: always
+    depends_on:
+      - l2_execution_engine
+      - taiko_client_driver
+      - zkevm_chain_prover_rpcd
+    env_file:
+      - .env
+    volumes:
+      - ./script/l2:/script
+    entrypoint:
+      - /bin/sh
+      - -c
+      - "/script/start-prover-relayer.sh"
+    <<: *logging
+
+  taiko_client_proposer:
+    image: gcr.io/evmchain/taiko-client:grimsvotn
+    restart: unless-stopped
+    pull_policy: always
+    depends_on:
+      - l2_execution_engine
+      - taiko_client_driver
+    env_file:
+      - .env
+    volumes:
+      - ./script/l2:/script
+    entrypoint:
+      - /bin/sh
+      - -c
+      - "/script/start-proposer.sh"
+    <<: *logging
+
+  zkevm_chain_prover_rpcd:
+    image: gcr.io/evmchain/grimsvotn-proverd:latest
+    restart: unless-stopped
+    pull_policy: always
+    env_file:
+      - .env
+    volumes:
+      - ./script/l2:/script
+      - zkevm_chain_prover_rpcd_data:/data
+    entrypoint:
+      - /bin/sh
+      - -c
+      - "/script/start-zkevm-chain-rpcd.sh"
+    deploy:
+      replicas: ${ZKEVM_CHAIN_INSTANCES_NUM:-1}
+      resources:
+        limits:
+          memory: 16G
+    <<: *logging
+
+  prometheus:
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    ports:
+      - ${PORT_PROMETHEUS}:9090
+    depends_on:
+      - l2_execution_engine
+      - taiko_client_driver
+    volumes:
+      - ./docker/prometheus/l2:/etc/prometheus
+      - prometheus_data:/prometheus
+    command:
+      - --log.level=debug
+      - --config.file=/etc/prometheus/prometheus.yml
+    <<: *logging
+
+  grafana:
+    image: grafana/grafana:latest
+    restart: unless-stopped
+    ports:
+      - ${PORT_GRAFANA}:3000
+    depends_on:
+      - l2_execution_engine
+      - taiko_client_driver
+      - prometheus
+    environment:
+      - GF_PATHS_CONFIG=/etc/grafana/custom/settings.ini
+      - GF_PATHS_PROVISIONING=/etc/grafana/custom/provisioning
+      - GF_LOG_LEVEL=WARN
+    volumes:
+      - ./docker/grafana/custom/settings.ini:/etc/grafana/custom/settings.ini
+      - ./docker/grafana/custom/l2/provisioning/:/etc/grafana/custom/provisioning/
+      - grafana_data:/var/lib/grafana
+    <<: *logging
+
+  graph-node:
+    image: graphprotocol/graph-node
+    ports:
+      - "8000:8000"
+      - "8001:8001"
+      - "8020:8020"
+      - "8030:8030"
+      - "8040:8040"
+    depends_on:
+      - ipfs
+      - postgres
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    environment:
+      postgres_host: postgres
+      postgres_user: graph-node
+      postgres_pass: let-me-in
+      postgres_db: graph-node
+      ipfs: "ipfs:5001"
+      ethereum: "mainnet:http://host.docker.internal:8547"
+      GRAPH_LOG: info
+
+  ipfs:
+    image: ipfs/go-ipfs:v0.10.0
+    ports:
+      - "5001:5001"
+    volumes:
+      - ./data/ipfs:/data/ipfs
+
+  postgres:
+    image: postgres:14
+    ports:
+      - "5432:5432"
+    command: ["postgres", "-cshared_preload_libraries=pg_stat_statements"]
+    environment:
+      POSTGRES_USER: graph-node
+      POSTGRES_PASSWORD: let-me-in
+      POSTGRES_DB: graph-node
+      # FIXME: remove this env. var. which we shouldn't need. Introduced by
+      # <https://github.com/graphprotocol/graph-node/pull/3511>, maybe as a
+      # workaround for https://github.com/docker/for-mac/issues/6270?
+      PGDATA: "/var/lib/postgresql/data"
+      POSTGRES_INITDB_ARGS: "-E UTF8 --locale=C"
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+
+volumes:
+  l2_execution_engine_data:
+  zkevm_chain_prover_rpcd_data:
+  prometheus_data:
+  grafana_data:
